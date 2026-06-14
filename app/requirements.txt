@@ -1,0 +1,4 @@
+yfinance
+python-dotenv
+requests
+feedparser

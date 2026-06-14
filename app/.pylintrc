@@ -1,0 +1,28 @@
+# Pylint configuration for the daily_market app.
+#
+# These scripts talk to a lot of flaky external services (yfinance, FMP, FRED,
+# Tradier, Reddit/WSJ RSS, Ollama, Telegram). The deliberate design is
+# fail-soft: one bad ticker or one dead feed must NEVER crash the daily brief.
+# A few of pylint's defaults fight that design, so we relax them here once
+# rather than scatter inline `# pylint: disable=` comments across every fetch.
+
+[MESSAGES CONTROL]
+# broad-exception-caught (W0718): intentional. The per-item `except Exception`
+# blocks are the whole fail-soft strategy — they record the failure inline and
+# keep the rest of the brief rendering. Narrowing them would make the brief
+# MORE fragile against the wide range of errors these libraries raise.
+disable =
+    broad-exception-caught
+
+[FORMAT]
+max-line-length = 100
+# market_brief.py is a deliberately flat, single-file data-collection script.
+# Splitting it for the line count alone would hurt more than help.
+max-module-lines = 2000
+
+[DESIGN]
+# Table/section builders legitimately hold many per-column locals, and the
+# CLI dispatchers branch on run mode — raise these above the strict defaults.
+max-locals = 25
+max-returns = 8
+max-args = 8

@@ -1,0 +1,3 @@
+# Dev/test dependencies (not needed to run the pipeline). Install with:
+#   pip install -r requirements-dev.txt
+pytest

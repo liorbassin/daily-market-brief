@@ -1,0 +1,51 @@
+# Secrets / credentials — NEVER commit
+.env
+secrets/
+
+# Environment Files
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.log
+
+# Runtime caches / local state (regenerated each run)
+options_history.json
+.last_sent
+
+# Generated briefing + market-data artifacts (rebuilt daily by the pipeline;
+# these are OUTPUT, not source — keep them off GitHub)
+market_data.md
+final_briefing*.md
+
+# Local databases / generated state
+*.db
+*.sqlite
+*.sqlite3
+
+# Claude local settings
+.claude/settings.local.json
+.claude/settings.json
+.claude/agents/
+.claude/hooks/
+.claude/skills/
+
+# VS Code local settings
+.vscode/settings.json
+
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test/cache tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
