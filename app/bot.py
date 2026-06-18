@@ -46,13 +46,17 @@ from core import (
     SUPPORTED_LANGUAGES,
     add_tickers,
     check_required_env,
+    is_allowed_chat,
     is_supported_format,
     is_supported_language,
     remove_tickers,
     seed_new_subscriber,
     send_telegram,
+    send_telegram_status,
     show_watchlist,
     translate_text,
+    SEND_OK,
+    SEND_BLOCKED,
 )
 
 # Subscriber persistence. db.init() creates the schema + runs the one-shot
@@ -346,10 +350,16 @@ def _translation_for(lang, briefing, sig):
     return result
 
 
-def _broadcast_briefing(briefing, sig):
+def _broadcast_briefing(briefing, sig, delivered=None):
     """Send `briefing` to every active subscriber in their chosen language.
-    Returns True only if every send for every subscriber succeeded — caller
-    uses that to decide whether to advance the .last_sent watermark.
+    Returns True only if every subscriber who still needed it was reached — the
+    caller uses that to decide whether to advance the .last_sent watermark.
+
+    `delivered` is a set of chat_ids that already received THIS briefing
+    signature on a prior attempt. Those chats are skipped, so a retry after a
+    partial failure only re-sends to the chats that actually missed it — a chat
+    that already got the brief is never sent a duplicate. Each chat is added to
+    `delivered` the moment its main briefing send succeeds.
 
     Formatting: the briefing is plain text from the LLM; bold is added in
     code by _apply_html_formatting as the final step (after translate → trim →
@@ -359,13 +369,23 @@ def _broadcast_briefing(briefing, sig):
     The translation-failure notice stays plain (parse_mode=None) — it's a
     fixed string with nothing to format.
     """
-    recipients = db.list_active_subscribers_with_prefs()
+    delivered = delivered if delivered is not None else set()
+    # Allowlist filter: an existing active subscriber who isn't (or is no
+    # longer) on the allowlist — e.g. a stranger who subscribed before the
+    # allowlist existed — is silently dropped here, so the /start gate and the
+    # broadcast can never disagree about who's a valid recipient.
+    recipients = [
+        r for r in db.list_active_subscribers_with_prefs() if is_allowed_chat(r[0])
+    ]
     if not recipients:
-        print("  no active subscribers — nothing to broadcast.")
+        print("  no active allowlisted subscribers — nothing to broadcast.")
         return True
 
     overall_ok = True
     for chat_id, lang, fmt in recipients:
+        if chat_id in delivered:
+            continue  # already received this exact briefing — never resend
+
         # Unknown language code in the DB (e.g. someone removed an entry
         # from SUPPORTED_LANGUAGES) — fall back to the default.
         if not is_supported_language(lang):
@@ -379,17 +399,31 @@ def _broadcast_briefing(briefing, sig):
 
         if not translated_ok and lang != DEFAULT_LANGUAGE:
             # Tell the user their language is unavailable, then send the
-            # English original so they're not left without a brief.
-            if not send_telegram(
+            # English original so they're not left without a brief. Best-effort:
+            # the brief send below is what decides this chat's disposition, so a
+            # blip on this notice doesn't independently pin the watermark.
+            send_telegram(
                 _TRANSLATION_ERROR_NOTICE, parse_mode=None, chat_id=chat_id
-            ):
-                overall_ok = False
+            )
 
-        if not send_telegram(personalized, parse_mode="HTML", chat_id=chat_id):
-            print(f"  send to chat {chat_id} (lang={lang}) failed.")
-            overall_ok = False
-        else:
+        status = send_telegram_status(
+            personalized, parse_mode="HTML", chat_id=chat_id)
+        if status == SEND_OK:
+            delivered.add(chat_id)
             print(f"  sent to chat {chat_id} (lang={lang}, fmt={fmt}).")
+        elif status == SEND_BLOCKED:
+            # Permanently unreachable (blocked the bot / deleted account). Drop
+            # it from the active set so it can NEVER pin the watermark again,
+            # and DON'T flip overall_ok — the brief reached everyone reachable,
+            # so the watermark should advance. This is the fix for the stuck-
+            # watermark re-send loop a single blocked stranger used to cause.
+            db.deactivate_subscriber(chat_id)
+            print(f"  chat {chat_id} unreachable (403/blocked) — deactivated; "
+                  "won't retry.")
+        else:  # SEND_FAILED — transient; hold the watermark and retry next loop
+            print(f"  send to chat {chat_id} (lang={lang}) failed (transient); "
+                  "will retry.")
+            overall_ok = False
     return overall_ok
 
 
@@ -459,7 +493,7 @@ def _handle_refresh_command(chat_id):
     """Validate cooldown + single-run lock, then kick off a background refresh.
     Returns the immediate reply. Admin (env CHAT_ID) bypasses the cooldown;
     other subscribers are limited to once per _REFRESH_COOLDOWN_SEC."""
-    is_admin = bool(CHAT_ID) and str(chat_id) == str(CHAT_ID)
+    is_admin = _is_admin(chat_id)
     now = time.monotonic()
 
     if not is_admin:
@@ -550,6 +584,31 @@ _HELP_TEXT = """Commands:
 /refresh            rebuild your brief now with the latest data
 /stop               unsubscribe""".strip()
 
+# Sent to a denied chat (or as the generic fallback). Kept deliberately vague —
+# no command list, no hint the bot does anything useful — so an unknown chat
+# can't probe it. The allowlist lives in core (admin CHAT_ID + ALLOWED_CHAT_IDS)
+# plus the DB-backed approvals in db.access.
+_NOT_AUTHORIZED_TEXT = "This is a private bot."
+
+# First message from a chat we've never seen: we file an access request and tell
+# them it's been forwarded to the admin.
+_ACCESS_REQUESTED_TEXT = (
+    "This is a private bot. Your access request has been sent to the admin — "
+    "you'll get a message here if you're approved."
+)
+
+# Repeat message from a chat whose request is already on the admin's queue.
+_ACCESS_PENDING_TEXT = (
+    "Your access request is still pending the admin's review. You'll be "
+    "notified here once it's decided."
+)
+
+# Sent to a chat the moment the admin approves it.
+_ACCESS_GRANTED_TEXT = "✅ You've been approved! You'll start receiving the daily brief here."
+
+# Admin-only commands, routed before the private-bot gate when sent by the admin.
+_ACCESS_ADMIN_COMMANDS = ("/approve", "/deny", "/kick", "/pending")
+
 
 def _format_supported_languages():
     """Pretty list of supported codes for use in /language replies.
@@ -634,6 +693,125 @@ def _welcome_text(is_returning):
     )
 
 
+# ----------------------------------------------------------------------------
+# Access control: stranger request flow + admin approve/deny/kick
+# ----------------------------------------------------------------------------
+
+def _is_admin(chat_id):
+    """True if `chat_id` is the env-configured admin chat. Compared as strings
+    because CHAT_ID comes from env as a string and Telegram sends ints."""
+    return bool(CHAT_ID) and str(chat_id) == str(CHAT_ID)
+
+
+def _parse_chat_id_arg(s):
+    """Parse a /approve|/deny|/kick argument into an int chat_id, or None."""
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _notify_admin_of_request(chat_id, username, first_name):
+    """DM the admin that a new chat wants access, with one-tap approve/deny
+    commands. Best-effort: a delivery failure here just means the admin can
+    still find the request via /pending."""
+    if not CHAT_ID:
+        return
+    name = first_name or "(no name)"
+    handle = f"@{username}" if username else "(no username)"
+    msg = (
+        "🔔 New access request\n"
+        f"Name: {name} {handle}\n"
+        f"chat_id: {chat_id}\n\n"
+        f"Approve: /approve {chat_id}\n"
+        f"Deny:    /deny {chat_id}"
+    )
+    try:
+        send_telegram(msg, parse_mode=None, chat_id=CHAT_ID)
+    except Exception as e:  # noqa: BLE001 — notifying must never break the reply
+        print(f"Failed to notify admin of access request from {chat_id}: {e}")
+
+
+def _handle_unapproved(chat_id, username, first_name):
+    """Reply for a chat that isn't allowed yet. Files an access request the
+    first time and pings the admin; stays quiet (no re-ping) for repeats and
+    for chats the admin already denied."""
+    status = db.record_access_request(chat_id, username, first_name)
+    if status == "new":
+        _notify_admin_of_request(chat_id, username, first_name)
+        print(f"New access request from chat_id={chat_id} (@{username or '-'}).")
+        return _ACCESS_REQUESTED_TEXT
+    if status == "pending":
+        return _ACCESS_PENDING_TEXT
+    # 'denied' (or any stale status) — generic refusal, no info leak, no re-ping.
+    return _NOT_AUTHORIZED_TEXT
+
+
+def _approve_chat(target):
+    """Admin granted access to `target`: mark approved, subscribe them (seeding
+    the default watchlist if brand-new), and notify them. Returns the admin's
+    confirmation line."""
+    acc = db.get_access(target)
+    username = acc[2] if acc else None
+    first_name = acc[3] if acc else None
+
+    db.set_access_status(target, "approved", username, first_name)
+    # Subscribe now so they don't have to /start; seed only a brand-new chat.
+    was_new = db.add_subscriber(target, username, first_name)
+    if was_new and not db.load_watchlist(target):
+        seed_new_subscriber(target)
+
+    try:
+        send_telegram(_ACCESS_GRANTED_TEXT + "\n\n" + _HELP_TEXT, chat_id=target)
+    except Exception as e:  # noqa: BLE001
+        print(f"Approved {target} but failed to notify them: {e}")
+    name = first_name or str(target)
+    return f"✅ Approved {name} ({target}). They're subscribed and notified."
+
+
+def _revoke_chat(target, verb):
+    """Shared logic for /deny and /kick: mark denied and deactivate any
+    subscription so `target` stops receiving briefs and can't re-spam the admin.
+    Silent toward the target (no antagonizing message)."""
+    db.set_access_status(target, "denied")
+    removed = db.deactivate_subscriber(target)
+    suffix = " (was an active subscriber — now unsubscribed)" if removed else ""
+    return f"🚫 {verb} {target}.{suffix}"
+
+
+def _format_pending():
+    """Render the admin's /pending list of chats awaiting a decision."""
+    rows = db.list_pending()
+    if not rows:
+        return "No pending access requests."
+    lines = ["Pending access requests:"]
+    for cid, username, first_name, _requested_at in rows:
+        name = first_name or "(no name)"
+        handle = f" @{username}" if username else ""
+        lines.append(f"• {name}{handle} — {cid}")
+    lines.append("\nApprove: /approve <chat_id>   Deny: /deny <chat_id>")
+    return "\n".join(lines)
+
+
+def _handle_access_admin(command, args):
+    """Dispatch an admin access command. Caller has already confirmed the
+    sender is the admin."""
+    if command == "/pending":
+        return _format_pending()
+    if not args:
+        return f"Usage: {command} <chat_id>"
+    target = _parse_chat_id_arg(args[0])
+    if target is None:
+        return f"Invalid chat id: {args[0]!r}"
+    if command == "/approve":
+        return _approve_chat(target)
+    if command == "/deny":
+        return _revoke_chat(target, "Denied")
+    if command == "/kick":
+        return _revoke_chat(target, "Kicked")
+    return _HELP_TEXT  # unreachable — command was in _ACCESS_ADMIN_COMMANDS
+
+
 def handle_message(text, chat_id, username=None, first_name=None):
     """Map a raw text message to one of the bot commands. Returns the
     reply string that will be sent back to the caller.
@@ -647,6 +825,20 @@ def handle_message(text, chat_id, username=None, first_name=None):
 
     # commands case-insensitive
     command = parts[0].lower()
+
+    # Admin-only access management (/approve, /deny, /kick, /pending). Only the
+    # admin chat can drive these; for anyone else they fall through to the gate
+    # below (so a stranger typing /approve learns nothing).
+    if command in _ACCESS_ADMIN_COMMANDS and _is_admin(chat_id):
+        return _handle_access_admin(command, parts[1:])
+
+    # Private-bot gate. This is the door that used to be open: /start
+    # auto-subscribed anyone. A non-allowlisted chat can't subscribe or run
+    # commands — instead its first message files an access request the admin
+    # can approve from Telegram. The admin + ALLOWED_CHAT_IDS + already-approved
+    # chats pass straight through.
+    if not is_allowed_chat(chat_id):
+        return _handle_unapproved(chat_id, username, first_name)
 
     if command == "/start":
         # add_subscriber returns True for brand-new OR previously-inactive
@@ -685,7 +877,17 @@ def handle_message(text, chat_id, username=None, first_name=None):
     if command == "/refresh":                       # no args expected
         return _handle_refresh_command(chat_id)
 
-    # Unrecognized command or plain text — show help.
+    # Unrecognized command or plain text — show help. The admin also sees the
+    # access-management commands so they're discoverable beyond the per-request
+    # notification.
+    if _is_admin(chat_id):
+        return _HELP_TEXT + (
+            "\n\nAdmin:\n"
+            "/pending            list access requests\n"
+            "/approve <chat_id>  grant access\n"
+            "/deny <chat_id>     reject a request\n"
+            "/kick <chat_id>     remove a subscriber"
+        )
     return _HELP_TEXT
 
 
@@ -710,6 +912,9 @@ def run_bot():
     offset = None                                   # last seen Telegram update_id + 1
     # last forwarded briefing signature
     last_sig = load_last_sent()
+    # Per-signature set of chat_ids already delivered, so a retry after a
+    # partial failure never re-sends to a chat that already got the brief.
+    delivered_by_sig = {}
 
     while True:
         try:
@@ -751,16 +956,20 @@ def run_bot():
             if sig and sig != last_sig:
                 print("New final_briefing.md detected. Broadcasting...")
                 briefing = BRIEFING_PATH.read_text(encoding="utf-8")
-                if _broadcast_briefing(briefing, sig):
+                delivered = delivered_by_sig.setdefault(sig, set())
+                if _broadcast_briefing(briefing, sig, delivered):
                     save_last_sent(sig)
                     last_sig = sig
+                    delivered_by_sig.clear()   # this sig is done; free memory
                     print("Broadcast complete.")
                 else:
-                    # Don't update last_sig on partial failure — retry on
-                    # the next loop iteration so a flaky chat or translation
-                    # endpoint gets another shot without manual intervention.
+                    # Don't update last_sig on partial failure — retry on the
+                    # next loop iteration. `delivered` carries which chats already
+                    # got it, so only the chats that MISSED it are retried; nobody
+                    # who already received the brief gets a duplicate.
                     print(
-                        "Broadcast had failures; will retry on next loop iteration."
+                        "Broadcast had failures; will retry only the missed chats "
+                        "on the next loop iteration."
                     )
 
         except requests.RequestException as e:

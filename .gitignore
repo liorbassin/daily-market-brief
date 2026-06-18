@@ -18,7 +18,11 @@ options_history.json
 # Generated briefing + market-data artifacts (rebuilt daily by the pipeline;
 # these are OUTPUT, not source — keep them off GitHub)
 market_data.md
+market_data_structured.json
 final_briefing*.md
+
+# Best-effort fetched-article cache (regenerated on demand)
+cache/
 
 # Local databases / generated state
 *.db

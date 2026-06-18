@@ -84,6 +84,15 @@ CREATE TABLE IF NOT EXISTS watchlists (
   FOREIGN KEY (chat_id) REFERENCES subscribers(chat_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS ix_watchlists_chat ON watchlists(chat_id);
+
+CREATE TABLE IF NOT EXISTS access (
+  chat_id      INTEGER PRIMARY KEY,
+  status       TEXT NOT NULL,          -- 'pending' | 'approved' | 'denied'
+  username     TEXT,
+  first_name   TEXT,
+  requested_at TEXT NOT NULL,
+  decided_at   TEXT
+);
 """
 
 
@@ -259,6 +268,98 @@ def list_active_chat_ids():
             "SELECT chat_id FROM subscribers WHERE active = 1 ORDER BY chat_id"
         )
         return [row[0] for row in cur.fetchall()]
+
+
+# ----------------------------------------------------------------------------
+# Access control (admin-approval allowlist)
+# ----------------------------------------------------------------------------
+# The bot is private. `access` records each chat's authorization decision so the
+# admin can approve/deny FROM Telegram without editing .env + restarting (the
+# env ALLOWED_CHAT_IDS list in core.py still works and is checked first). States:
+#   pending  — a non-allowlisted chat asked for access; awaiting the admin
+#   approved — admin granted access; is_approved() lets them through the gate
+#   denied   — admin rejected; stays silent so they can't re-spam the admin
+
+def record_access_request(chat_id, username=None, first_name=None):
+    """Log a /start (or any first message) from a non-allowlisted chat and
+    return what should happen next:
+      'new'      — first time we've seen this chat → admin should be notified
+      'pending'  — already awaiting a decision → DON'T re-notify (anti-spam)
+      'approved' — already approved (caller normally won't reach this)
+      'denied'   — previously denied → stay silent, DON'T re-notify
+    Contact info is refreshed every call so the admin sees the current handle,
+    but an existing status is never changed here."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT status FROM access WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO access"
+                " (chat_id, status, username, first_name, requested_at)"
+                " VALUES (?, 'pending', ?, ?, ?)",
+                (chat_id, username, first_name, _now_iso()),
+            )
+            return "new"
+        conn.execute(
+            "UPDATE access SET username = ?, first_name = ? WHERE chat_id = ?",
+            (username, first_name, chat_id),
+        )
+        return row[0]
+
+
+def is_approved(chat_id):
+    """True if `chat_id` has been explicitly approved by the admin. Consulted by
+    core.is_allowed_chat (OR'd with the static env allowlist)."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT 1 FROM access WHERE chat_id = ? AND status = 'approved'",
+            (chat_id,),
+        ).fetchone() is not None
+
+
+def set_access_status(chat_id, status, username=None, first_name=None):
+    """Upsert an admin decision ('approved' / 'denied'). Stamps decided_at.
+    Creates the row if the admin acts on a chat_id that never filed a request
+    (e.g. adding someone proactively). Always returns True."""
+    with _connect() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM access WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        if exists is None:
+            conn.execute(
+                "INSERT INTO access"
+                " (chat_id, status, username, first_name, requested_at, decided_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, status, username, first_name, _now_iso(), _now_iso()),
+            )
+        else:
+            conn.execute(
+                "UPDATE access SET status = ?, decided_at = ? WHERE chat_id = ?",
+                (status, _now_iso(), chat_id),
+            )
+        return True
+
+
+def get_access(chat_id):
+    """Return (chat_id, status, username, first_name, requested_at, decided_at)
+    for `chat_id`, or None if it has no access row."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT chat_id, status, username, first_name, requested_at, decided_at"
+            " FROM access WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+
+
+def list_pending():
+    """Chats awaiting an access decision, oldest first. Returns
+    [(chat_id, username, first_name, requested_at), ...]."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT chat_id, username, first_name, requested_at FROM access"
+            " WHERE status = 'pending' ORDER BY requested_at"
+        ).fetchall()
 
 
 # ----------------------------------------------------------------------------

@@ -46,6 +46,7 @@ from core import (
     TRADIER_TOKEN,
     check_required_env,
     escape_md,
+    is_allowed_chat,
     load_watchlist,
     send_telegram,
 )
@@ -2010,6 +2011,10 @@ def main():
         ([env_chat] if env_chat is not None else [])
         + db.list_active_chat_ids()
     ))
+    # Allowlist filter: same private-bot gate the live bot applies, so a
+    # stranger who's still active=1 in the DB never receives the daily brief
+    # from this path either. The admin is always on the allowlist.
+    recipients = [c for c in recipients if is_allowed_chat(c)]
     if not recipients:
         print("No recipients — nothing to send.")
         return

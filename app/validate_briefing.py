@@ -25,6 +25,7 @@ Exit codes:
   2 — could not read an input file
 """
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -275,6 +276,399 @@ def markdown_warnings(briefing):
 
 
 # ---------------------------------------------------------------------------
+# Output-structure validation (the contract the LLM must satisfy)
+# ---------------------------------------------------------------------------
+
+# The 8 required top-level section headers, in order. The bot keys routing off
+# the leading emoji, so presence of the emoji is what we check.
+REQUIRED_SECTIONS = (
+    ("🧭", "BOTTOM LINE"),
+    ("🔥", "EXECUTIVE MARKET READ"),
+    ("📊", "MACRO DASHBOARD"),
+    ("👀", "WATCHLIST DASHBOARD"),
+    ("🎯", "TRADE IDEAS"),
+    ("📰", "HIGHEST RELEVANCE STORIES"),
+    ("📈", "POTENTIAL NEW WATCHLIST CANDIDATES"),
+    ("⚠️", "KEY RISKS"),
+)
+_SECTION_EMOJIS = tuple(emo for emo, _ in REQUIRED_SECTIONS)
+
+_PLACEHOLDER_RE = re.compile(r"\{\{[^}]*\}\}")
+_THINK_RE = re.compile(r"</?think\b|</?reasoning\b", re.IGNORECASE)
+# A [[SPLIT]] marker line (mirrors core._split_marker handling; kept local so
+# this module imports without pulling core's env-loading side effects).
+_SPLIT_MARKER_RE = re.compile(r"^\s*\[\[SPLIT\]\]\s*$", re.MULTILINE)
+# A well-formed watchlist entry line: bullet + ticker, nothing else.
+_WATCHLIST_OK_RE = re.compile(r"^•\s*[A-Z][A-Z0-9.\^=]{0,9}$")
+
+_MAX_SEGMENT = 4096      # Telegram hard limit -> fatal if exceeded
+_WARN_SEGMENT = 3500     # target ceiling -> warning if exceeded
+
+
+def check_required_sections(briefing):
+    return [f"missing required section: {emo} {name}"
+            for emo, name in REQUIRED_SECTIONS if emo not in briefing]
+
+
+def check_no_placeholders(briefing):
+    found = sorted(set(_PLACEHOLDER_RE.findall(briefing)))
+    return [f"unsubstituted placeholder token: {tok}" for tok in found]
+
+
+def check_think_leakage(briefing):
+    return (["<think>/reasoning tags leaked into the briefing"]
+            if _THINK_RE.search(briefing) else [])
+
+
+def _section_body(briefing, emoji):
+    """Text of the section that starts with `emoji`, up to the next top-level
+    section header (or end). Excludes the header line itself."""
+    head = re.search(rf"^{re.escape(emoji)}.*$", briefing, re.MULTILINE)
+    if not head:
+        return ""
+    rest = briefing[head.end():]
+    others = [e for e in _SECTION_EMOJIS if e != emoji]
+    nxt = re.search("^(" + "|".join(re.escape(e) for e in others) + ").*$",
+                    rest, re.MULTILINE)
+    return rest[:nxt.start()] if nxt else rest
+
+
+def _watchlist_section(briefing):
+    return _section_body(briefing, "👀")
+
+
+def check_watchlist_ticker_lines(briefing):
+    """Every bulleted watchlist line must be exactly '• TICKER'."""
+    errors = []
+    for line in _watchlist_section(briefing).splitlines():
+        s = line.rstrip()
+        if s.startswith("•") and not _WATCHLIST_OK_RE.match(s):
+            errors.append(f"malformed watchlist ticker line: {s!r} "
+                          f"(must be '• TICKER' only)")
+    return errors
+
+
+def check_watchlist_content(briefing, watchlist_tickers=None):
+    """The 👀 WATCHLIST DASHBOARD must contain ticker cards: at least one line
+    that is exactly '• TICKER'. Reject '* TICKER' / '1. TICKER' bullets and
+    (when a structured watchlist is known) tickers not in that universe."""
+    errors = []
+    watchlist_tickers = set(watchlist_tickers or [])
+    section = _watchlist_section(briefing)
+    if not section.strip():
+        return ["WATCHLIST DASHBOARD section is empty (no ticker cards)"]
+
+    valid = []
+    for line in section.splitlines():
+        s = line.rstrip()
+        m = _WATCHLIST_OK_RE.match(s)
+        if m:
+            valid.append(s.lstrip("• ").strip())
+        elif re.match(r"^\*\s+[A-Z]", s):
+            errors.append(f"watchlist uses a markdown '* ' bullet: {s!r} (use '• TICKER')")
+        elif re.match(r"^\d+\.\s+[A-Z]", s):
+            errors.append(f"watchlist uses a numbered bullet: {s!r} (use '• TICKER')")
+
+    if not valid:
+        errors.append("WATCHLIST DASHBOARD has no valid '• TICKER' cards")
+        return errors
+
+    if watchlist_tickers:
+        invented = [t for t in valid if t not in watchlist_tickers]
+        if invented:
+            errors.append("WATCHLIST DASHBOARD lists ticker(s) not in the "
+                          f"structured watchlist: {', '.join(sorted(set(invented)))}")
+    return errors
+
+
+def check_split_segments(briefing):
+    """Return (fatal, warnings) for [[SPLIT]] sizing/placement."""
+    fatal, warnings = [], []
+    segments = [p.strip("\n") for p in _SPLIT_MARKER_RE.split(briefing) if p.strip()]
+    for i, seg in enumerate(segments, 1):
+        n = len(seg)
+        if n > _MAX_SEGMENT:
+            fatal.append(f"segment {i} is {n} chars (> {_MAX_SEGMENT} Telegram limit)")
+        elif n > _WARN_SEGMENT:
+            warnings.append(f"segment {i} is {n} chars (> {_WARN_SEGMENT} target)")
+    # A marker should be followed by a top-level section header.
+    for m in _SPLIT_MARKER_RE.finditer(briefing):
+        after = briefing[m.end():].lstrip("\n")
+        nxt = after.splitlines()[0] if after.splitlines() else ""
+        if nxt and not nxt.startswith(_SECTION_EMOJIS):
+            warnings.append("a [[SPLIT]] marker is not at a top-level section "
+                            f"boundary (before: {nxt[:40]!r})")
+    return fatal, warnings
+
+
+def check_trade_grounding(briefing, levels):
+    """Fatal error per Entry/Stop/Tgt that isn't grounded in Key Levels."""
+    errors = []
+    for card in validate_trades(briefing, levels):
+        for label, value, matched in card["checks"]:
+            if matched is None:
+                errors.append(f"{card['ticker']}: {label} {value:g} not grounded "
+                              f"in Key Levels (invented price)")
+    return errors
+
+
+def check_trade_directions(briefing, levels):
+    """LONG -> stop < entry < target; SHORT -> stop > entry > target."""
+    errors = []
+    for card in parse_trade_cards(briefing, set(levels)):
+        d, e, s, t = (card["direction"], card["entry"],
+                      card["stop"], card["target"])
+        if d == "long" and None not in (e, s, t):
+            if not (s < e < t):
+                errors.append(f"{card['ticker']} LONG: expected stop<entry<target, "
+                              f"got stop={s:g} entry={e:g} target={t:g}")
+        elif d == "short" and None not in (e, s, t):
+            if not (s > e > t):
+                errors.append(f"{card['ticker']} SHORT: expected stop>entry>target, "
+                              f"got stop={s:g} entry={e:g} target={t:g}")
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Quality contract (the SKILL.md format/grounding rules, enforced strictly)
+# ---------------------------------------------------------------------------
+
+NO_SETUP_LINE = "No high-conviction setups in today's data."
+
+_HTML_TAG_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9]*(\s[^>]*)?>")
+
+# Required macro items (SKILL.md) -> keyword alternatives used to detect both
+# whether the structured data carries the item and whether the briefing mentions
+# it. Word-ish substrings, matched case-insensitively within the macro section.
+_MACRO_REQUIRED = (
+    ("S&P futures", ("s&p", "es ", "spx", "e-mini")),
+    ("Nasdaq futures", ("nasdaq", "nq ")),
+    ("10Y Treasury yield", ("10y", "10-year", "10 year", "tnx", "ten-year")),
+    ("VIX", ("vix",)),
+    ("Dollar", ("dollar", "dxy", "greenback")),
+    ("Oil", ("oil", "wti", "brent", "crude")),
+    ("Bitcoin", ("bitcoin", "btc")),
+)
+# Off-contract macro lines that signal the model replaced the dashboard with
+# generic macro it invented. Fatal only when absent from the supplied data.
+_MACRO_OFF_CONTRACT = ("fed funds", "leading indicators", "inflation")
+
+# Generic/technical terms the model tends to hallucinate. Fatal unless the exact
+# term is present in the structured data (it never is for the invented ones).
+_UNSUPPORTED_TERMS = (
+    "macd", "rsi", "overbought", "oversold", "divergence", "call spread",
+    "put spread", "options play", "institutional support",
+    "earnings beat expectations",
+)
+
+
+def check_markdown_fatal(briefing):
+    """Plain-text Telegram channel: ANY markdown/HTML markup is fatal for local
+    models. Deduped to one error per kind so the repair list stays readable."""
+    errors, seen = [], set()
+
+    def add(reason):
+        if reason not in seen:
+            seen.add(reason)
+            errors.append(reason)
+
+    for line in briefing.splitlines():
+        s = line.strip()
+        if "```" in line:
+            add("markdown code fence ``` present (plain text only)")
+        if re.match(r"#{1,6}\s", s):
+            add("markdown header '#' present (plain text only)")
+        if re.match(r"(\*\*\*|---|___)\s*$", s):
+            add("markdown horizontal rule present")
+        if re.search(r"\*\*[^*\n]+\*\*", line) or re.search(r"\*[^*\n]+\*", line):
+            add("markdown bold/italic '*' present (use ALL-CAPS, not markdown)")
+        if re.match(r"\*\s", s):
+            add("markdown '* ' bullet present (use '•')")
+        if s.count("|") >= 2:
+            add("markdown table pipes '|' present (use card layout, not tables)")
+        if _HTML_TAG_RE.search(line):
+            add("HTML tag present (plain text only)")
+    return errors
+
+
+def check_macro_dashboard(briefing, structured_data=None):
+    """MACRO DASHBOARD must include the required SKILL.md items that ARE present
+    in the supplied macro data, and must not substitute off-contract items."""
+    section = _section_body(briefing, "📊")
+    if not section.strip():
+        return ["MACRO DASHBOARD section is empty"]
+    low = section.lower()
+
+    require_all = not isinstance(structured_data, dict)
+    macro_keys = ""
+    if isinstance(structured_data, dict):
+        macro_keys = " ".join((structured_data.get("macro_dashboard") or {})
+                              .keys()).lower()
+    blob = (json.dumps(structured_data, ensure_ascii=False).lower()
+            if structured_data else "")
+
+    errors = []
+    for concept, kws in _MACRO_REQUIRED:
+        available = require_all or any(k in macro_keys for k in kws)
+        if available and not any(k in low for k in kws):
+            errors.append(f"MACRO DASHBOARD missing required item: {concept}")
+    for phrase in _MACRO_OFF_CONTRACT:
+        if phrase in low and phrase not in blob:
+            errors.append("MACRO DASHBOARD contains off-contract item not in "
+                          f"supplied data: {phrase!r}")
+    return errors
+
+
+def check_trade_ideas_format(briefing):
+    """TRADE IDEAS must be EITHER the exact no-setup line OR one+ valid cards
+    (direction-emoji header + Entry/Stop/Tgt, or the explicit n/a line)."""
+    section = extract_trade_section(briefing)
+    if not section.strip():
+        return ["TRADE IDEAS section is empty"]
+    if NO_SETUP_LINE in section:
+        return []  # Case A
+
+    errors = []
+    if any(re.match(r"^\s*\d+\.\s+\S", ln) for ln in section.splitlines()):
+        errors.append("TRADE IDEAS uses numbered-list format; use trade cards "
+                      f"or the exact line: {NO_SETUP_LINE!r}")
+
+    valid_cards = 0
+    for block in re.split(r"\n\s*\n", section):
+        b = block.strip()
+        if not b:
+            continue
+        header = b.splitlines()[0]
+        has_emoji = any(emo in header for emo in _DIRECTION_EMOJI)
+        has_levels = bool(_LEVEL_LINE_RE.search(b))
+        has_na = "n/a (no level data)" in b.lower()
+        looks_like_idea = (has_emoji or has_levels
+                           or _DIRECTION_WORD_RE.search(b))
+        if not looks_like_idea:
+            continue  # eligibility prose / disclaimer
+        if not has_emoji:
+            errors.append("trade idea not in card format (missing 🟢/🔴/⚪ "
+                          f"header): {header[:60]!r}")
+            continue
+        labels = {lab.lower() for lab, _ in _LEVEL_LINE_RE.findall(b)}
+        has_triple = ({"entry", "stop"} <= labels
+                      and ("tgt" in labels or "target" in labels))
+        if not (has_triple or has_na):
+            errors.append("trade idea missing 'Entry <p>  Stop <p>  Tgt <p>' "
+                          f"(or 'Entry/Stop/Tgt: n/a (no level data)'): {header[:60]!r}")
+            continue
+        valid_cards += 1
+
+    if valid_cards == 0 and not errors:
+        errors.append("TRADE IDEAS has neither valid trade cards nor the exact "
+                      f"line: {NO_SETUP_LINE!r}")
+    return errors
+
+
+def check_unsupported_language(briefing, structured_blob=""):
+    """Reject hallucinated technical/generic terms not present in the data."""
+    low = briefing.lower()
+    blob = structured_blob or ""
+    errors = []
+    for term in _UNSUPPORTED_TERMS:
+        if re.search(r"\b" + re.escape(term) + r"\b", low) and term not in blob:
+            errors.append(f"unsupported/invented term not backed by data: {term!r}")
+    return errors
+
+
+def check_bottom_line(briefing):
+    """BOTTOM LINE must be 2-3 short lines incl. a 'Top idea:' line whose
+    ticker/prices appear in TRADE IDEAS (or 'Top idea: none …' when no setup)."""
+    section = _section_body(briefing, "🧭")
+    body = [ln.strip() for ln in section.splitlines() if ln.strip()]
+    errors = []
+    if not 2 <= len(body) <= 3:
+        errors.append(f"BOTTOM LINE must be 2-3 short lines, found {len(body)}")
+
+    top = next((ln for ln in body if "top idea" in ln.lower()), None)
+    if not top:
+        errors.append("BOTTOM LINE missing a 'Top idea:' line")
+        return errors
+
+    trade_section = extract_trade_section(briefing)
+    no_setup = NO_SETUP_LINE in trade_section
+    is_none = bool(re.search(r"top idea:\s*none", top, re.IGNORECASE))
+
+    if no_setup and not is_none:
+        errors.append("BOTTOM LINE must say 'Top idea: none — no high-conviction "
+                      "setup today.' when TRADE IDEAS has no setups")
+    if is_none:
+        return errors
+
+    for tok in _TICKER_TOKEN_RE.findall(top):
+        if tok in ("TICKER", "LONG", "SHORT") or len(tok) < 2:
+            continue
+        if tok not in trade_section:
+            errors.append(f"BOTTOM LINE top idea references {tok}, absent from "
+                          "TRADE IDEAS")
+    for num in re.findall(r"\d+\.\d+", top):
+        if num not in trade_section:
+            errors.append(f"BOTTOM LINE top idea price {num} not present in "
+                          "TRADE IDEAS")
+    return errors
+
+
+def validate_quality_contract(briefing, structured_data=None):
+    """Strict SKILL.md quality gate. Returns a list of FATAL error strings:
+    markdown markup, missing/empty watchlist cards, wrong MACRO items, non-card
+    or level-less trade ideas, hallucinated indicators, and BOTTOM LINE format.
+    `structured_data` (the parsed market_data_structured.json dict) tightens the
+    watchlist/macro/language checks; None makes them maximally strict."""
+    watchlist = (structured_data or {}).get("watchlist", []) \
+        if isinstance(structured_data, dict) else []
+    blob = (json.dumps(structured_data, ensure_ascii=False).lower()
+            if structured_data else "")
+
+    errors = []
+    errors += check_markdown_fatal(briefing)
+    errors += check_watchlist_content(briefing, watchlist)
+    errors += check_macro_dashboard(briefing, structured_data)
+    errors += check_trade_ideas_format(briefing)
+    errors += check_unsupported_language(briefing, blob)
+    errors += check_bottom_line(briefing)
+    return errors
+
+
+def validate_all(briefing, market_data, structured_data=None):
+    """Run every output check and split results into (fatal_errors, warnings).
+
+    FATAL (triggers the repair pass): empty output, <think> leakage, missing
+    required sections, leftover {{...}} placeholders, malformed/empty WATCHLIST
+    cards, ANY markdown/HTML markup, wrong MACRO items, non-card or level-less
+    TRADE IDEAS, hallucinated indicators, bad BOTTOM LINE, ungrounded/invented
+    trade levels, impossible LONG/SHORT ordering, and any Telegram segment over
+    the 4096 hard limit.
+
+    WARNINGS (logged, do NOT block delivery): segments over the 3500 target but
+    under 4096, and off-boundary [[SPLIT]] markers."""
+    fatal, warnings = [], []
+    if not briefing or not briefing.strip():
+        return ["briefing is empty"], warnings
+
+    levels = parse_key_levels(market_data) if market_data else {}
+
+    fatal += check_think_leakage(briefing)
+    fatal += check_required_sections(briefing)
+    fatal += check_no_placeholders(briefing)
+    fatal += check_watchlist_ticker_lines(briefing)
+    fatal += check_trade_grounding(briefing, levels)
+    fatal += check_trade_directions(briefing, levels)
+    fatal += validate_quality_contract(briefing, structured_data)
+
+    seg_fatal, seg_warn = check_split_segments(briefing)
+    fatal += seg_fatal
+    warnings += seg_warn
+
+    fatal = list(dict.fromkeys(fatal))  # de-dupe, preserve order
+    return fatal, warnings
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -325,13 +719,30 @@ def main():
         for line_no, reason in warns:
             print(f"  [warn] line {line_no}: {reason}")
 
+    # 3. Output-structure + quality check (fatal vs warning split)
+    print("\n-- Output-structure + quality check --")
+    structured = None
+    structured_path = APP_DIR / "market_data_structured.json"
+    if structured_path.exists():
+        try:
+            structured = json.loads(structured_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            structured = None
+    fatal, warnings = validate_all(briefing, market_data, structured)
+    if not fatal:
+        print("  no fatal structural errors")
+    for e in fatal:
+        print(f"  [FATAL] {e}")
+    for w in warnings:
+        print(f"  [warn]  {w}")
+
     print("\n-- Summary --")
     print(f"  trade cards: {grounded} grounded, {flagged} flagged, "
           f"{sum(1 for c in results if c['status'] == 'n/a')} n/a")
-    print(f"  markdown warnings: {len(warns)}")
+    print(f"  fatal errors: {len(fatal)}, warnings: {len(warnings)}")
 
-    if flagged:
-        print("  RESULT: FAIL (hallucinated trade level(s))")
+    if fatal:
+        print(f"  RESULT: FAIL ({len(fatal)} fatal error(s))")
         return 1
     print("  RESULT: PASS")
     return 0

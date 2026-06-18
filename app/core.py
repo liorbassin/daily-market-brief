@@ -114,6 +114,56 @@ def check_required_env():
 
 
 # ----------------------------------------------------------------------------
+# Subscription allowlist — the bot is PRIVATE by default
+# ----------------------------------------------------------------------------
+# Without this gate, /start auto-subscribes ANY Telegram user who messages the
+# bot, and the daily broadcast goes to every active row — so strangers who find
+# the bot start receiving your briefs. The allowlist locks both the /start door
+# and the broadcast to a known set of chat ids.
+#
+# The admin (TELEGRAM_CHAT_ID) is always allowed. ALLOWED_CHAT_IDS is an
+# optional comma-separated list of EXTRA chat ids to permit (e.g.
+# "111,222,333"). Leave it unset to lock the bot to the admin only.
+def _parse_allowed_chat_ids():
+    ids = set()
+    if CHAT_ID:
+        try:
+            ids.add(int(CHAT_ID))                         # admin is always allowed
+        except (TypeError, ValueError):
+            print(f"[core] TELEGRAM_CHAT_ID is not a valid int: {CHAT_ID!r}")
+    raw = os.getenv("ALLOWED_CHAT_IDS", "")
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            print(f"[core] Ignoring non-numeric ALLOWED_CHAT_IDS entry: {part!r}")
+    return ids
+
+
+# Computed once at import. Telegram chat ids are ints; we store/compare as ints.
+ALLOWED_CHAT_IDS = _parse_allowed_chat_ids()
+
+
+def is_allowed_chat(chat_id):
+    """True if `chat_id` may subscribe AND receive the daily brief. The bot is
+    private; a chat is permitted if ANY of these hold:
+      - it's the admin (TELEGRAM_CHAT_ID) or listed in the ALLOWED_CHAT_IDS env
+        var (static allowlist, parsed once at startup), OR
+      - the admin approved it from Telegram (db.access status 'approved') — this
+        is the dynamic path, so /approve takes effect with no restart.
+    Coerces to int so a string id (from env or a DB read) compares equal to
+    Telegram's int chat id."""
+    try:
+        cid = int(chat_id)
+    except (TypeError, ValueError):
+        return False
+    return cid in ALLOWED_CHAT_IDS or db.is_approved(cid)
+
+
+# ----------------------------------------------------------------------------
 # Watchlist persistence — now backed by SQLite (db.py); each Telegram chat
 # has its own watchlist scoped by chat_id. The legacy watchlist.json is
 # imported once on first DB init and then ignored.
@@ -369,8 +419,47 @@ def _post_message(message, parse_mode, chat_id):
         return None
 
 
+# Per-send outcome, so callers can tell apart "retry later" from "this chat is
+# gone for good". The broadcaster uses BLOCKED to deactivate a dead chat and
+# advance its watermark, while FAILED still pins the watermark for a retry.
+SEND_OK = "ok"            # delivered
+SEND_BLOCKED = "blocked"  # permanent: chat unreachable — drop it, don't retry
+SEND_FAILED = "failed"    # transient: network/rate-limit/server — retry later
+
+# Telegram error descriptions that mean the chat is permanently unreachable —
+# the bot will NEVER be able to deliver to it again, so there's no point holding
+# the broadcast watermark or retrying. A 403 status always means this; a few
+# 400s ("chat not found", a deactivated account/group) do too. Matched
+# case-insensitively as substrings because Telegram occasionally appends detail.
+_PERMANENT_SEND_ERRORS = (
+    "bot was blocked by the user",
+    "user is deactivated",
+    "chat not found",
+    "bot can't initiate conversation with a user",
+    "group chat was deactivated",
+    "peer_id_invalid",
+)
+
+
+def _is_permanent_send_failure(resp):
+    """True if `resp` is a Telegram rejection that will never succeed on retry
+    (blocked bot, deleted account, unknown chat). A 403 is always permanent; a
+    400 is only permanent if its description matches `_PERMANENT_SEND_ERRORS`
+    (a 400 from bad HTML is NOT — that's recoverable via the plain-text retry)."""
+    if resp is None:
+        return False                                     # transport error — transient
+    if resp.status_code == 403:
+        return True
+    try:
+        desc = (resp.json().get("description") or "").lower()
+    except ValueError:
+        desc = (resp.text or "").lower()
+    return any(s in desc for s in _PERMANENT_SEND_ERRORS)
+
+
 def _send_one(message, parse_mode="Markdown", chat_id=None):
-    """Internal: send a single, already-sized chunk.
+    """Internal: send a single, already-sized chunk. Returns one of SEND_OK /
+    SEND_BLOCKED / SEND_FAILED.
 
     `chat_id` defaults to the env CHAT_ID — backward compatible with every
     existing call site. Broadcast loops in market_brief.py pass an explicit
@@ -389,22 +478,51 @@ def _send_one(message, parse_mode="Markdown", chat_id=None):
     HTML safety net: if an HTML send is rejected (malformed tag/entity in the
     rendered chunk), retry the SAME chunk once as plain text so the subscriber
     never silently misses the brief over a formatting glitch. The retry is
-    per-chunk, so a good chunk is never re-sent (no duplicates)."""
+    per-chunk, so a good chunk is never re-sent (no duplicates). A PERMANENT
+    rejection (403/blocked) skips the retry — plain text won't reach a chat that
+    blocked the bot."""
     resp = _post_message(message, parse_mode, chat_id)
     if resp is None:
-        return False
+        return SEND_FAILED                               # transport error — retry later
     if resp.ok:
-        return True
+        return SEND_OK
     print(f"Telegram send failed: {resp.status_code} {resp.text}")
+    if _is_permanent_send_failure(resp):
+        return SEND_BLOCKED                              # chat gone — don't retry
     # Bad HTML → fall back to plain text for this chunk only.
     if parse_mode == "HTML":
         print("  retrying chunk as plain text (HTML rejected).")
         retry = _post_message(_html_to_plain(message), None, chat_id)
         if retry is not None and retry.ok:
-            return True
+            return SEND_OK
         if retry is not None:
             print(f"  plain-text retry also failed: {retry.status_code} {retry.text}")
-    return False
+            if _is_permanent_send_failure(retry):
+                return SEND_BLOCKED
+    return SEND_FAILED
+
+
+def send_telegram_status(message, parse_mode="Markdown", chat_id=None):
+    """Like send_telegram but returns the richer SEND_OK / SEND_BLOCKED /
+    SEND_FAILED outcome instead of a bool, so the broadcaster can deactivate a
+    permanently-blocked chat rather than retrying it forever.
+
+    Aggregation across chunks: a BLOCKED chunk short-circuits (the rest of the
+    message can't reach a blocked chat either); otherwise any FAILED chunk makes
+    the whole send FAILED; all-OK is OK.
+
+    Splitting is two-pass: first honor any `[[SPLIT]]` markers Claude inserted
+    (AUTHORITATIVE section boundaries), then run each marker-bounded chunk
+    through the paragraph splitter as a safety net for an oversize section."""
+    status = SEND_OK
+    for marker_chunk in _split_on_markers(message):
+        for chunk in _split_message(marker_chunk):
+            s = _send_one(chunk, parse_mode, chat_id)
+            if s == SEND_BLOCKED:
+                return SEND_BLOCKED                      # no point sending more chunks
+            if s == SEND_FAILED:
+                status = SEND_FAILED
+    return status
 
 
 def send_telegram(message, parse_mode="Markdown", chat_id=None):
@@ -417,23 +535,11 @@ def send_telegram(message, parse_mode="Markdown", chat_id=None):
     to whoever called the command (bot.py reads the from-chat off the
     incoming update and passes it through).
 
-    Returns True ONLY if every chunk succeeded — a partial failure (e.g.
-    chunk 2 of 3 fails) returns False so the caller can decide whether
-    to retry.
-
-    Splitting is two-pass: first honor any `[[SPLIT]]` markers Claude
-    inserted (these are AUTHORITATIVE section boundaries), then run each
-    marker-bounded chunk through the paragraph-based splitter as a safety
-    net in case Claude produced a section that's still over the Telegram
-    limit. Messages without markers go through the splitter directly, so
-    the auto-generated daily message in market_brief.main() is unaffected.
+    Returns True ONLY if every chunk was delivered — any partial failure or a
+    blocked chat returns False. Callers that need to distinguish "retry later"
+    from "chat is gone" should use send_telegram_status instead.
     """
-    overall_ok = True
-    for marker_chunk in _split_on_markers(message):
-        for chunk in _split_message(marker_chunk):
-            if not _send_one(chunk, parse_mode, chat_id):
-                overall_ok = False
-    return overall_ok
+    return send_telegram_status(message, parse_mode, chat_id) == SEND_OK
 
 
 # ----------------------------------------------------------------------------
